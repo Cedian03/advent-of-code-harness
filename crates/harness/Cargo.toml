@@ -1,0 +1,17 @@
+[package]
+name = "harness"
+description = "Advent of Code solving harness"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aoc-archive = { path = "../aoc-archive" }
+llm-http = { path = "../llm-http" }
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dotenvy.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

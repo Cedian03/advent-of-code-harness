@@ -1,0 +1,14 @@
+[package]
+name = "aoc-archive"
+description = "Local archive of Advent of Code puzzles: scrape, parse, and query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ego-tree.workspace = true
+scraper.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+ureq.workspace = true

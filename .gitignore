@@ -1,0 +1,51 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local Advent of Code state: puzzle text, raw cache, inputs, answers
+/.aoc/
+/solutions/**/input.txt
+/solutions/**/target/
+
+# Secrets and local configuration
+/.env
+/.env.*
+!/.env.example
+
+# Logs, event streams, coverage, profiling
+*.log
+/events.jsonl
+/coverage/
+*.profraw
+lcov.info
+/cobertura.xml
+/junit.xml
+/tarpaulin-report.*
+/flamegraph.svg
+perf.data*
+
+# Python solutions and helper scripts
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.code-workspace
+*.sw?
+.DS_Store
+desktop.ini
+Thumbs.db
+
+# Local tooling and scratch files
+.direnv/
+*.orig
+*.rej
+*~
+*.tmp

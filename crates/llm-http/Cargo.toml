@@ -1,0 +1,11 @@
+[package]
+name = "llm-http"
+description = "Minimal synchronous client for OpenAI-compatible chat completions"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
