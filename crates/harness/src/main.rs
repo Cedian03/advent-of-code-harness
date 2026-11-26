@@ -1,13 +1,22 @@
-use harness::agent::{Agent, AgentEvent};
-use harness::aoc::{self, Aoc, ArchiveAoc, TaskId, Verdict, tests_from_puzzle};
+use harness::address::{self, Selection};
+use harness::agent::{Agent, AgentEvent, SolveReport};
+use harness::aoc::{
+    self, Aoc, ArchiveAoc, PartAvailability, RunReport, TaskId, TestReport, Verdict,
+    answer_from_stdout, open_part, part_availability, tests_from_puzzle,
+};
 use harness::model::{Model, OpenAiModel, ReplayModel};
+use harness::part::{self, PartSelector};
+use harness::remote::{RemoteAoc, session_cookie_optional};
 use harness::runner;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use aoc_archive::client::Fetcher;
+use aoc_archive::remote::{RemoteDayState, calendar_stars};
 use aoc_archive::scrape::{self, ScrapeOptions, load_puzzle};
 use clap::{Args, Parser, Subcommand};
 
@@ -43,38 +52,28 @@ struct Cli {
 enum Command {
     /// Download puzzle statements (and inputs, if AOC_SESSION is set)
     Scrape(ScrapeArgs),
-    /// Report archive coverage
-    Status,
-    /// Print a captured statement as Markdown
-    Show { year: u32, day: u32 },
-    /// List days for a year with solution/input status
+    /// Import your personal puzzle input into the archive
+    Input(InputArgs),
+    /// Print a captured statement, or emit the task bundle as JSON
+    Show(ShowArgs),
+    /// Report state: Events without a Selection, Days with one
     List(ListArgs),
     /// Scaffold a solution for a day
     Init(InitArgs),
-    /// Import your personal puzzle input into the archive
-    Input(InputArgs),
-    /// Emit a machine-readable task bundle (statement, tests, paths)
-    Task { year: u32, day: u32 },
-    /// Run the solution against the detected example tests
-    Test(TestArgs),
-    /// Run the solution against your real puzzle input
+    /// Run the solution on examples or the real input
     Run(RunArgs),
     /// Drive an LLM loop that writes, tests, and runs a solution
     Solve(SolveArgs),
-    /// Pick the next unsolved day
+    /// Pick the next day with a Part that is not Recorded
     Next(NextArgs),
 }
 
 #[derive(Args)]
 struct ScrapeArgs {
-    /// Years to scrape: "2015-2025", "2024,2019", or a single year.
-    /// Defaults to every past event (and the current one in December).
-    #[arg(long)]
-    years: Option<String>,
-
-    /// Days to scrape: "1-25" or a single day.
-    #[arg(long, default_value = "1-25")]
-    days: String,
+    /// Days or Events to scrape. Repeat addresses; let the shell expand spans:
+    /// `harness scrape 20{15..25}`. No addresses means every past Event.
+    #[arg(value_name = "SELECTION", value_parser = address::parse_address)]
+    selection: Vec<String>,
 
     /// Minimum seconds between HTTP requests. AoC asks for at most one per second.
     #[arg(long, default_value_t = 1.1)]
@@ -88,24 +87,52 @@ struct ScrapeArgs {
     #[arg(long)]
     reparse: bool,
 
+    /// Wait for one Day to be released. The value caps the wait (default 24h).
+    #[arg(long, value_name = "DUR", num_args = 0..=1, default_missing_value = "24h")]
+    wait: Option<String>,
+
     /// Environment variable holding your adventofcode.com session cookie.
     #[arg(long, default_value = "AOC_SESSION")]
     cookie_env: String,
-}
-
-#[derive(Args)]
-struct ListArgs {
-    #[arg(long)]
-    year: Option<u32>,
 
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Args)]
+struct ListArgs {
+    /// Days or Events to list. Repeat addresses; let the shell expand spans.
+    #[arg(value_name = "SELECTION", value_parser = address::parse_address)]
+    selection: Vec<String>,
+
+    /// Refresh the Stars column from the site. Requires a Session.
+    #[arg(long)]
+    stars: bool,
+
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ShowArgs {
+    /// Puzzle to show, e.g. 2025/1.
+    #[arg(value_parser = address::parse_day)]
+    day: TaskId,
+
+    /// Which part to show (default: all captured parts).
+    #[arg(long, value_parser = part::parse_part, default_value = "all")]
+    part: PartSelector,
+
+    /// Emit the task bundle as JSON instead of Markdown.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct InitArgs {
-    year: u32,
-    day: u32,
+    /// Puzzle to scaffold, e.g. 2025/1.
+    #[arg(value_parser = address::parse_day)]
+    day: TaskId,
 
     /// Copy a puzzle input into the archive (never committed).
     #[arg(long)]
@@ -114,30 +141,20 @@ struct InitArgs {
     /// Overwrite an existing solve.rs.
     #[arg(long)]
     force: bool,
+
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
 struct InputArgs {
-    year: u32,
-    day: u32,
+    /// Puzzle to import an input for, e.g. 2025/1.
+    #[arg(value_parser = address::parse_day)]
+    day: TaskId,
 
     /// Read the input from this file instead of stdin.
     #[arg(long)]
     file: Option<PathBuf>,
-}
-
-#[derive(Args)]
-struct TestArgs {
-    year: u32,
-    day: u32,
-
-    /// Override the solution command (sh -c; input on stdin, AOC_PART set).
-    #[arg(long)]
-    cmd: Option<String>,
-
-    /// Only test one part.
-    #[arg(long)]
-    part: Option<u8>,
 
     #[arg(long)]
     json: bool,
@@ -145,7 +162,8 @@ struct TestArgs {
 
 #[derive(Args)]
 struct NextArgs {
-    #[arg(long)]
+    /// Event to search, e.g. 2025. Defaults to every archived Event.
+    #[arg(value_parser = address::parse_event)]
     year: Option<u32>,
 
     #[arg(long)]
@@ -154,8 +172,25 @@ struct NextArgs {
 
 #[derive(Args)]
 struct SolveArgs {
-    year: u32,
-    day: u32,
+    /// Puzzle to solve, e.g. 2025/1.
+    #[arg(value_parser = address::parse_day)]
+    day: TaskId,
+
+    /// Which part(s) to solve: 1, 2, or all (default: all).
+    #[arg(long, value_parser = part::parse_part, default_value = "all")]
+    part: PartSelector,
+
+    /// Wait for the Day to be released. The value caps the wait (default 24h).
+    #[arg(long, value_name = "DUR", num_args = 0..=1, default_missing_value = "24h")]
+    wait: Option<String>,
+
+    /// Let the agent submit answers to adventofcode.com. Requires a Session.
+    #[arg(long, conflicts_with = "no_submit")]
+    submit: bool,
+
+    /// Record answers locally instead of submitting them.
+    #[arg(long)]
+    no_submit: bool,
 
     /// Model id (or HARNESS_MODEL / OPENAI_MODEL).
     #[arg(long)]
@@ -195,22 +230,46 @@ struct SolveArgs {
 
 #[derive(Args)]
 struct RunArgs {
-    year: u32,
-    day: u32,
+    /// Puzzle to run, e.g. 2025/1.
+    #[arg(value_parser = address::parse_day)]
+    day: TaskId,
+
+    /// Run the detected example tests instead of the real input.
+    #[arg(long)]
+    examples: bool,
 
     /// Override the solution command (sh -c; input on stdin, AOC_PART set).
     #[arg(long)]
     cmd: Option<String>,
 
-    /// Which part to run (default: 1).
-    #[arg(long, default_value_t = 1)]
-    part: u8,
+    /// Which part(s) to run: 1, 2, or all (default: 1).
+    #[arg(long, value_parser = part::parse_part, default_value = "1")]
+    part: PartSelector,
 
     #[arg(long)]
     json: bool,
 }
 
-fn main() -> Result<()> {
+/// Submission is opt-in. The default lives here and nowhere else.
+const SUBMIT_BY_DEFAULT: bool = false;
+
+/// A usage or precondition error: the invocation is impossible, so exit 2.
+#[derive(Debug)]
+struct UsageError(String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+fn usage(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(UsageError(message.into()))
+}
+
+fn main() {
     silence_sigpipe();
     let cli = Cli::parse();
     let dotenv_result = dotenvy::dotenv();
@@ -228,15 +287,23 @@ fn main() -> Result<()> {
         solutions = %cli.solutions.display(),
         "harness starting"
     );
+    if let Err(err) = run_cli(cli) {
+        if err.downcast_ref::<UsageError>().is_some() {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+        eprintln!("error: {err:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Scrape(args) => scrape_command(args, &cli.archive),
-        Command::Status => status_command(&cli.archive),
-        Command::Show { year, day } => show_command(&cli.archive, year, day),
+        Command::Input(args) => input_command(args, &cli.archive),
+        Command::Show(args) => show_command(args, &cli.archive, &cli.solutions),
         Command::List(args) => list_command(args, &cli.archive, &cli.solutions),
         Command::Init(args) => init_command(args, &cli.archive, &cli.solutions),
-        Command::Input(args) => input_command(args, &cli.archive),
-        Command::Task { year, day } => task_command(year, day, &cli.archive, &cli.solutions),
-        Command::Test(args) => test_command(args, &cli.archive, &cli.solutions, &cli.build_dir),
         Command::Run(args) => run_command(args, &cli.archive, &cli.solutions, &cli.build_dir),
         Command::Solve(args) => solve_command(args, &cli.archive, &cli.solutions, &cli.build_dir),
         Command::Next(args) => next_command(args, &cli.archive, &cli.solutions, &cli.build_dir),
@@ -291,19 +358,32 @@ fn silence_sigpipe() {
 fn silence_sigpipe() {}
 
 fn scrape_command(args: ScrapeArgs, archive: &Path) -> Result<()> {
-    let years = match &args.years {
-        Some(spec) => parse_years(spec)?,
-        None => default_years(),
-    };
-    let days = parse_days(&args.days)?;
-
     if args.delay < 1.0 {
-        bail!(
-            "--delay must be at least 1.0 seconds; AoC asks clients to make at most one request per second"
-        );
+        return Err(usage(
+            "--delay must be at least 1.0 seconds; AoC asks clients to make at most one request per second",
+        ));
     }
 
-    let cookie = std::env::var(&args.cookie_env).ok();
+    let selection = Selection::parse(&args.selection)?;
+    if let Some(value) = &args.wait {
+        let Some(id) = selection.single_day() else {
+            return Err(usage(
+                "--wait requires exactly one Day, e.g. `harness scrape 2025/1 --wait`",
+            ));
+        };
+        wait_for_day(id, parse_duration(value)?)?;
+    }
+
+    let (years, days) = scrape_targets(&selection)?;
+    let summary_days = days.clone();
+
+    let cookie = std::env::var(&args.cookie_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if cookie.is_none() {
+        warning("no AOC_SESSION: public pages only — no inputs, no Part Two, no stars");
+    }
+
     let root = scrape::run(&ScrapeOptions {
         years,
         days,
@@ -314,27 +394,275 @@ fn scrape_command(args: ScrapeArgs, archive: &Path) -> Result<()> {
         cookie,
     })?;
 
-    let total: usize = root.years.iter().map(|y| y.scraped_days()).sum();
-    let part2: usize = root
+    let entries: Vec<_> = root
         .years
         .iter()
-        .flat_map(|y| &y.days)
-        .filter(|d| d.parts_captured >= 2)
-        .count();
-    let inputs: usize = root
-        .years
+        .flat_map(|year| year.days.iter().map(move |day| (year.year, day)))
+        .filter(|(year, day)| {
+            summary_days
+                .as_ref()
+                .is_none_or(|days| days.contains(&(*year, day.day)))
+        })
+        .collect();
+
+    if args.json {
+        let days: Vec<_> = entries
+            .iter()
+            .map(|(year, day)| {
+                serde_json::json!({
+                    "year": year,
+                    "day": day.day,
+                    "address": TaskId::new(*year, day.day).to_string(),
+                    "title": day.title,
+                    "captured": day.scraped,
+                    "parts_captured": day.parts_captured,
+                    "tests": day.tests,
+                    "input": day.input,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "days": days }))?
+        );
+        return Ok(());
+    }
+
+    let total = entries.len();
+    let part2 = entries
         .iter()
-        .flat_map(|year| &year.days)
-        .filter(|entry| entry.input.is_some())
+        .filter(|(_, day)| day.parts_captured >= 2)
         .count();
+    let inputs = entries
+        .iter()
+        .filter(|(_, day)| day.input.is_some())
+        .count();
+    let years = entries
+        .iter()
+        .map(|(year, _)| *year)
+        .collect::<BTreeSet<_>>()
+        .len();
     eprintln!(
-        "\nArchive: {total} day(s) across {} year(s); {part2} with Part Two; {inputs} with inputs.",
-        root.years.len()
+        "\nArchive: {total} day(s) across {years} year(s); {part2} with Part Two; {inputs} with inputs."
     );
     Ok(())
 }
 
-fn status_command(archive: &Path) -> Result<()> {
+/// Years plus an optional exact Day set, as the scraper expects.
+type ScrapeTargets = (Vec<u32>, Option<BTreeSet<(u32, u32)>>);
+
+/// Resolve a Selection into the scraper's years plus exact Days. An empty
+/// Selection means every past Event and all of its Days.
+fn scrape_targets(selection: &Selection) -> Result<ScrapeTargets> {
+    match selection.day_set() {
+        None => Ok((default_years(), None)),
+        Some(days) => {
+            let years = days
+                .iter()
+                .map(|(year, _)| *year)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            Ok((years, Some(days)))
+        }
+    }
+}
+
+fn warning(message: &str) {
+    eprintln!("warning: {message}");
+}
+
+/// Parse a `--wait` ceiling such as `30s`, `90m`, or `24h`.
+fn parse_duration(value: &str) -> Result<Duration> {
+    let value = value.trim();
+    let (number, unit) = value.split_at(value.len().saturating_sub(1));
+    let amount: u64 = number
+        .parse()
+        .map_err(|_| usage(format!("invalid duration `{value}`; use e.g. 90m or 24h")))?;
+    let seconds = match unit {
+        "s" => amount,
+        "m" => amount.saturating_mul(60),
+        "h" => amount.saturating_mul(3_600),
+        _ => return Err(usage(format!("invalid duration `{value}`; use s, m, or h"))),
+    };
+    Ok(Duration::from_secs(seconds))
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 3_600 {
+        format!("{}h{}m", seconds / 3_600, (seconds % 3_600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Hold until a Day is released, refusing when the release is beyond the
+/// ceiling. An already released Day is a no-op.
+fn wait_for_day(id: TaskId, ceiling: Duration) -> Result<()> {
+    let release = aoc::release_unix(id.year, id.day);
+    let now = aoc::now_unix();
+    if now >= release {
+        return Ok(());
+    }
+
+    let remaining = Duration::from_secs((release - now) as u64);
+    let instant = aoc::release_label(id.year, id.day);
+    if remaining > ceiling {
+        return Err(usage(format!(
+            "{id} has not been released (unlocks {instant}); waiting {} exceeds the {} ceiling",
+            format_duration(remaining),
+            format_duration(ceiling)
+        )));
+    }
+
+    eprintln!(
+        "waiting for {id}: releases {instant} ({})",
+        format_duration(remaining)
+    );
+    let lead = remaining.saturating_sub(Duration::from_secs(120));
+    if !lead.is_zero() {
+        std::thread::sleep(lead);
+    }
+
+    loop {
+        let now = aoc::now_unix();
+        if now >= release {
+            eprintln!("{id} is released");
+            return Ok(());
+        }
+        let remaining = (release - now) as u64;
+        let jitter = (now.unsigned_abs() % 4) as u64;
+        eprintln!(
+            "waiting for {id}: {} remaining",
+            format_duration(Duration::from_secs(remaining))
+        );
+        std::thread::sleep(Duration::from_secs((remaining.min(10) + jitter).max(1)));
+    }
+}
+
+fn show_command(args: ShowArgs, archive: &Path, solutions: &Path) -> Result<()> {
+    let id = args.day;
+    match args.part.explicit() {
+        Some(part) => ensure_part(archive, id, part)?,
+        // `all` still needs Part One; an Unreleased or uncaptured Day should
+        // fail with the same domain message as an explicit selector.
+        None => ensure_part(archive, id, 1)?,
+    }
+
+    if args.json {
+        print_task_bundle(id, archive, solutions, args.part)?;
+        return Ok(());
+    }
+
+    let path = scrape::puzzle_dir(archive, id.year, id.day).join("puzzle.md");
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("no captured puzzle at {}", path.display()))?;
+    match args.part {
+        PartSelector::All => print!("{text}"),
+        PartSelector::One => print!("{}", statement_slice(&text, 1)),
+        PartSelector::Two => print!("{}", statement_slice(&text, 2)),
+    }
+    Ok(())
+}
+
+/// Slice the generated Markdown at its `## Part Two` heading.
+fn statement_slice(markdown: &str, part: u8) -> String {
+    const MARKER: &str = "\n## Part Two";
+    match part {
+        1 => markdown
+            .split(MARKER)
+            .next()
+            .unwrap_or(markdown)
+            .trim_end()
+            .to_string(),
+        2 => markdown
+            .find(MARKER)
+            .map(|index| markdown[index..].trim_start().to_string())
+            .unwrap_or_default(),
+        _ => markdown.to_string(),
+    }
+}
+
+/// Reject an explicitly selected Part that cannot be acted on.
+fn ensure_part(archive: &Path, id: TaskId, part: u8) -> Result<()> {
+    if let Some(message) = part_availability(archive, id, part).error(id, part) {
+        return Err(usage(message));
+    }
+    Ok(())
+}
+
+fn list_command(args: ListArgs, archive: &Path, solutions: &Path) -> Result<()> {
+    let selection = Selection::parse(&args.selection)?;
+
+    if args.stars {
+        let cookie = session_cookie_optional().ok_or_else(|| {
+            usage("list --stars needs AOC_SESSION; set it in .env, or drop --stars")
+        })?;
+        let years = if selection.is_empty() {
+            scrape::available_years(archive)
+                .iter()
+                .map(|year| year.year)
+                .collect::<Vec<_>>()
+        } else {
+            selection.years()
+        };
+        if years.is_empty() {
+            return Err(usage(format!(
+                "no archive in {} yet — run `harness scrape` first",
+                archive.display()
+            )));
+        }
+        refresh_stars(archive, &years, cookie, Duration::from_secs_f64(1.1))?;
+    }
+
+    if selection.is_empty() {
+        list_events(archive, solutions, args.json)
+    } else {
+        list_days(&selection.days(), archive, solutions, args.json)
+    }
+}
+
+/// Refresh the cached Stars column from the site's calendar.
+fn refresh_stars(archive: &Path, years: &[u32], cookie: String, delay: Duration) -> Result<()> {
+    let mut fetcher = Fetcher::new(archive.to_path_buf(), Some(cookie), delay, true);
+    for &year in years {
+        let calendar_html = fetcher.calendar_fresh(year)?;
+        let stars = calendar_stars(year, &calendar_html);
+        for day in 1..=25 {
+            let count = stars.get(&day).copied().unwrap_or(0);
+            let existing = RemoteDayState::load(archive, year, day);
+            if count == 0 && existing.is_none() {
+                continue;
+            }
+            let mut state = existing.unwrap_or_else(|| RemoteDayState::new(year, day));
+            state.stars = state.stars.max(count);
+            state.part1.solved |= count >= 1;
+            state.part2.solved |= count >= 2;
+            if state.part1.solved {
+                state.part2_unlocked = true;
+            }
+            state.save(archive)?;
+        }
+    }
+    Ok(())
+}
+
+/// No Selection: one row per Event.
+fn list_events(archive: &Path, _solutions: &Path, json: bool) -> Result<()> {
+    struct Row {
+        year: u32,
+        days: usize,
+        captured: usize,
+        part_two: usize,
+        inputs: usize,
+        tests: u32,
+        recorded: usize,
+        stars: u32,
+    }
+
     let years = scrape::available_years(archive);
     if years.is_empty() {
         bail!(
@@ -343,152 +671,272 @@ fn status_command(archive: &Path) -> Result<()> {
         );
     }
 
-    println!(
-        "{:<6} {:>5} {:>9} {:>8} {:>7} {:>6}",
-        "Year", "Days", "Captured", "Part 2", "Inputs", "Tests"
-    );
-    let mut days = 0;
-    let mut captured = 0;
-    let mut part2 = 0;
-    let mut inputs = 0;
-    let mut tests = 0;
-    for year in &years {
-        let year_days = year.days.len();
-        let year_captured = year.scraped_days();
-        let year_part2 = year.days.iter().filter(|d| d.parts_captured >= 2).count();
-        let year_inputs = year
-            .days
-            .iter()
-            .filter(|day| has_input(archive, year.year, day.day))
-            .count();
-        let year_tests: u32 = year.days.iter().map(|d| d.tests).sum();
-        println!(
-            "{:<6} {:>5} {:>9} {:>8} {:>7} {:>6}",
-            year.year, year_days, year_captured, year_part2, year_inputs, year_tests
-        );
-        days += year_days;
-        captured += year_captured;
-        part2 += year_part2;
-        inputs += year_inputs;
-        tests += year_tests;
-    }
-    println!(
-        "\n{} day(s) on the calendar, {} captured, {} with Part Two, {} with inputs, {} detected example tests.",
-        days, captured, part2, inputs, tests
-    );
-    if part2 == 0 && inputs == 0 {
-        println!(
-            "Set AOC_SESSION and re-run `harness scrape` to add Part Two statements, inputs, and your past answers."
-        );
-    }
-    Ok(())
-}
-
-fn show_command(archive: &Path, year: u32, day: u32) -> Result<()> {
-    let path = scrape::puzzle_dir(archive, year, day).join("puzzle.md");
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("no captured puzzle at {}", path.display()))?;
-    print!("{text}");
-    Ok(())
-}
-
-fn list_command(args: ListArgs, archive: &Path, solutions: &Path) -> Result<()> {
-    let years = scrape::available_years(archive);
-    let year = match args.year {
-        Some(year) => year,
-        None => years
-            .last()
-            .map(|index| index.year)
-            .context("no archive yet — run `harness scrape` first")?,
-    };
-    let index = years
+    let rows: Vec<Row> = years
         .iter()
-        .find(|index| index.year == year)
-        .with_context(|| format!("no archived data for {year}"))?;
+        .map(|year| Row {
+            year: year.year,
+            days: year.days.len(),
+            captured: year.scraped_days(),
+            part_two: year
+                .days
+                .iter()
+                .filter(|day| day.parts_captured >= 2)
+                .count(),
+            inputs: year
+                .days
+                .iter()
+                .filter(|day| has_input(archive, year.year, day.day))
+                .count(),
+            tests: year.days.iter().map(|day| day.tests).sum(),
+            recorded: year
+                .days
+                .iter()
+                .filter(|day| !recorded_parts(archive, TaskId::new(year.year, day.day)).is_empty())
+                .count(),
+            stars: year
+                .days
+                .iter()
+                .map(|day| recorded_stars(archive, TaskId::new(year.year, day.day)) as u32)
+                .sum(),
+        })
+        .collect();
 
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(index)?);
+    if json {
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "year": row.year,
+                    "days": row.days,
+                    "captured": row.captured,
+                    "part_two": row.part_two,
+                    "inputs": row.inputs,
+                    "tests": row.tests,
+                    "recorded": row.recorded,
+                    "stars": row.stars,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "years": rows }))?
+        );
         return Ok(());
     }
 
     println!(
-        "{:<3} {:<44} {:>5} {:>3} {:>6} {:>9}",
-        "Day", "Title", "Tests", "P2", "Input", "Solution"
+        "{:<6} {:>5} {:>9} {:>8} {:>7} {:>6} {:>9} {:>6}",
+        "Year", "Days", "Captured", "Part 2", "Inputs", "Tests", "Recorded", "Stars"
     );
-    for entry in &index.days {
-        let title = entry.title.as_deref().unwrap_or("-");
+    for row in &rows {
         println!(
-            "{:<3} {:<44} {:>5} {:>3} {:>6} {:>9}",
-            entry.day,
-            truncate(title, 44),
-            entry.tests,
-            if entry.parts_captured >= 2 {
-                "yes"
-            } else {
-                "no"
-            },
-            if has_input(archive, year, entry.day) {
-                "yes"
-            } else {
-                "no"
-            },
-            if solution_exists(solutions, year, entry.day) {
-                "yes"
-            } else {
-                "no"
-            }
+            "{:<6} {:>5} {:>9} {:>8} {:>7} {:>6} {:>9} {:>6}",
+            row.year,
+            row.days,
+            row.captured,
+            row.part_two,
+            row.inputs,
+            row.tests,
+            row.recorded,
+            row.stars
         );
     }
     Ok(())
 }
 
+/// A Selection: one row per Day, ascending.
+fn list_days(days: &[TaskId], archive: &Path, solutions: &Path, json: bool) -> Result<()> {
+    struct Row {
+        id: TaskId,
+        title: String,
+        tests: usize,
+        part_two: bool,
+        input: bool,
+        recorded: Vec<u8>,
+        stars: u8,
+        solution: bool,
+    }
+
+    let years = scrape::available_years(archive);
+    let rows: Vec<Row> = days
+        .iter()
+        .map(|id| {
+            let entry = years
+                .iter()
+                .find(|index| index.year == id.year)
+                .and_then(|index| index.days.iter().find(|entry| entry.day == id.day));
+            let puzzle = load_puzzle(archive, id.year, id.day).ok();
+            Row {
+                id: *id,
+                title: puzzle
+                    .as_ref()
+                    .map(|puzzle| puzzle.title.clone())
+                    .or_else(|| entry.and_then(|entry| entry.title.clone()))
+                    .unwrap_or_else(|| "-".to_string()),
+                tests: puzzle
+                    .as_ref()
+                    .map(|puzzle| tests_from_puzzle(puzzle).len())
+                    .or_else(|| entry.map(|entry| entry.tests as usize))
+                    .unwrap_or(0),
+                part_two: puzzle.as_ref().is_some_and(|puzzle| puzzle.is_complete())
+                    || entry.is_some_and(|entry| entry.parts_captured >= 2),
+                input: has_input(archive, id.year, id.day),
+                recorded: recorded_parts(archive, *id),
+                stars: recorded_stars(archive, *id),
+                solution: solution_exists(solutions, id.year, id.day),
+            }
+        })
+        .collect();
+
+    if json {
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "year": row.id.year,
+                    "day": row.id.day,
+                    "address": row.id.to_string(),
+                    "title": row.title,
+                    "tests": row.tests,
+                    "part_two_captured": row.part_two,
+                    "input": row.input,
+                    "recorded": row.recorded,
+                    "stars": row.stars,
+                    "solution": row.solution,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+
+    println!(
+        "{:<8} {:<44} {:>5} {:>3} {:>6} {:>9} {:>6} {:>9}",
+        "Day", "Title", "Tests", "P2", "Input", "Recorded", "Stars", "Solution"
+    );
+    for row in &rows {
+        println!(
+            "{:<8} {:<44} {:>5} {:>3} {:>6} {:>9} {:>6} {:>9}",
+            row.id,
+            truncate(&row.title, 44),
+            row.tests,
+            yes_no(row.part_two),
+            yes_no(row.input),
+            row.recorded.len(),
+            row.stars,
+            yes_no(row.solution),
+        );
+    }
+    Ok(())
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn recorded_parts(archive: &Path, id: TaskId) -> Vec<u8> {
+    let answers_path = scrape::puzzle_dir(archive, id.year, id.day).join("answers.json");
+    let mut parts: Vec<u8> = fs::read_to_string(answers_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<BTreeMap<String, String>>(&text).ok())
+        .map(|answers| {
+            answers
+                .keys()
+                .filter_map(|part| part.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Ok(puzzle) = load_puzzle(archive, id.year, id.day) {
+        for (index, answer) in puzzle.answers.iter().enumerate() {
+            if answer.is_some() {
+                parts.push((index + 1) as u8);
+            }
+        }
+    }
+    parts.sort_unstable();
+    parts.dedup();
+    parts
+}
+
+fn recorded_stars(archive: &Path, id: TaskId) -> u8 {
+    RemoteDayState::load(archive, id.year, id.day)
+        .map(|state| state.stars)
+        .unwrap_or(0)
+}
+
 fn init_command(args: InitArgs, archive: &Path, solutions: &Path) -> Result<()> {
+    let id = args.day;
     let dir = solutions
-        .join(args.year.to_string())
-        .join(format!("{:02}", args.day));
+        .join(id.year.to_string())
+        .join(format!("{:02}", id.day));
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
-    let solved = ["solve", "solve.py", "solve.rs"]
+    let existed = ["solve", "solve.py", "solve.rs"]
         .iter()
         .any(|name| dir.join(name).is_file());
     let source = dir.join("solve.rs");
-    if args.force || !solved {
+    let created = args.force || !existed;
+    if created {
         fs::write(&source, RUST_TEMPLATE)
             .with_context(|| format!("writing {}", source.display()))?;
+    }
+
+    let input_path = if let Some(input) = &args.input {
+        if fs::metadata(input)
+            .with_context(|| format!("reading {}", input.display()))?
+            .len()
+            == 0
+        {
+            return Err(usage("input is empty; nothing imported"));
+        }
+        let target = scrape::puzzle_dir(archive, id.year, id.day).join("input.txt");
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(input, &target)
+            .with_context(|| format!("copying {} to {}", input.display(), target.display()))?;
+        Some(target)
+    } else {
+        None
+    };
+
+    let captured = scrape::puzzle_dir(archive, id.year, id.day)
+        .join("puzzle.json")
+        .is_file();
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "year": id.year,
+                "day": id.day,
+                "address": id.to_string(),
+                "solution": source,
+                "created": created,
+                "input": input_path,
+                "captured": captured,
+            }))?
+        );
+        return Ok(());
+    }
+
+    if created {
         println!("created {}", source.display());
     } else {
         println!("solution already exists in {}", dir.display());
     }
-
-    if let Some(input) = args.input {
-        let target = scrape::puzzle_dir(archive, args.year, args.day).join("input.txt");
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(&input, &target)
-            .with_context(|| format!("copying {} to {}", input.display(), target.display()))?;
+    if let Some(target) = &input_path {
         println!("imported input -> {}", target.display());
     }
-
-    if !scrape::puzzle_dir(archive, args.year, args.day)
-        .join("puzzle.json")
-        .is_file()
-    {
-        println!(
-            "note: no archived statement for {}/{} — run `harness scrape --years {} --days {}`",
-            args.year, args.day, args.year, args.day
-        );
+    if !captured {
+        println!("note: no archived statement for {id} — run `harness scrape {id}`");
     }
-
-    println!("next: harness test {} {}", args.year, args.day);
+    println!("next: harness run {id} --examples");
     Ok(())
 }
 
 fn input_command(args: InputArgs, archive: &Path) -> Result<()> {
-    if !(1..=25).contains(&args.day) {
-        bail!("day must be within 1-25");
-    }
-
+    let id = args.day;
     let bytes = match &args.file {
         Some(path) => fs::read(path).with_context(|| format!("reading {}", path.display()))?,
         None => {
@@ -505,20 +953,32 @@ fn input_command(args: InputArgs, archive: &Path) -> Result<()> {
     };
 
     if bytes.is_empty() {
-        bail!("input is empty; nothing imported");
+        return Err(usage("input is empty; nothing imported"));
     }
 
-    let id = TaskId::new(args.year, args.day);
     let path = write_input(archive, id, &bytes)?;
-    println!("imported {} bytes -> {}", bytes.len(), path.display());
-    if !scrape::puzzle_dir(archive, args.year, args.day)
+    let captured = scrape::puzzle_dir(archive, id.year, id.day)
         .join("puzzle.json")
-        .is_file()
-    {
+        .is_file();
+
+    if args.json {
         println!(
-            "note: no archived puzzle for {id} yet — run `harness scrape --years {} --days {}`",
-            args.year, args.day
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "year": id.year,
+                "day": id.day,
+                "address": id.to_string(),
+                "path": path,
+                "bytes": bytes.len(),
+                "captured": captured,
+            }))?
         );
+        return Ok(());
+    }
+
+    println!("imported {} bytes -> {}", bytes.len(), path.display());
+    if !captured {
+        println!("note: no archived puzzle for {id} yet — run `harness scrape {id}`");
     }
     Ok(())
 }
@@ -532,40 +992,54 @@ fn write_input(archive: &Path, id: TaskId, bytes: &[u8]) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn task_command(year: u32, day: u32, archive: &Path, solutions: &Path) -> Result<()> {
-    let puzzle = load_puzzle(archive, year, day)?;
-    let dir = scrape::puzzle_dir(archive, year, day);
-    let statement = fs::read_to_string(dir.join("puzzle.md")).unwrap_or_default();
-    let id = TaskId::new(year, day);
+fn print_task_bundle(
+    id: TaskId,
+    archive: &Path,
+    solutions: &Path,
+    part: PartSelector,
+) -> Result<()> {
+    let puzzle = load_puzzle(archive, id.year, id.day)?;
+    let dir = scrape::puzzle_dir(archive, id.year, id.day);
+    let full_statement = fs::read_to_string(dir.join("puzzle.md")).unwrap_or_default();
+    let statement = match part.explicit() {
+        Some(part) => statement_slice(&full_statement, part),
+        None => full_statement,
+    };
     let input = find_input(archive, id);
-    let tests = tests_from_puzzle(&puzzle);
+    let tests: Vec<_> = tests_from_puzzle(&puzzle)
+        .into_iter()
+        .filter(|test| part.includes(test.part))
+        .collect();
 
     let bundle = serde_json::json!({
-        "year": year,
-        "day": day,
+        "year": id.year,
+        "day": id.day,
         "title": puzzle.title,
         "url": puzzle.url,
         "part_two_captured": puzzle.is_complete(),
+        "parts": puzzle.parts.iter().map(|part| part.number).collect::<Vec<_>>(),
         "statement": statement,
         "input_path": input.as_ref().map(|path| path.to_string_lossy()),
-        "solution_dir": solutions.join(year.to_string()).join(format!("{day:02}")),
+        "solution_dir": solutions.join(id.year.to_string()).join(format!("{:02}", id.day)),
         "tests": tests,
     });
     println!("{}", serde_json::to_string_pretty(&bundle)?);
     Ok(())
 }
 
-fn test_command(args: TestArgs, archive: &Path, solutions: &Path, build_dir: &Path) -> Result<()> {
-    let puzzle = load_puzzle(archive, args.year, args.day)?;
-    let mut tests = tests_from_puzzle(&puzzle);
-    if let Some(part) = args.part {
-        tests.retain(|test| test.part == part);
+fn run_examples(args: &RunArgs, archive: &Path, solutions: &Path, build_dir: &Path) -> Result<()> {
+    let id = args.day;
+    match args.part.explicit() {
+        Some(part) => ensure_part(archive, id, part)?,
+        None => ensure_part(archive, id, 1)?,
     }
+    let puzzle = load_puzzle(archive, id.year, id.day)?;
+    let mut tests = tests_from_puzzle(&puzzle);
+    tests.retain(|test| args.part.includes(test.part));
     if tests.is_empty() {
         println!(
-            "{}/{:02} has no detected example tests{}.",
-            args.year,
-            args.day,
+            "{} has no detected example tests{}.",
+            id,
             if puzzle.is_complete() {
                 ""
             } else {
@@ -575,19 +1049,15 @@ fn test_command(args: TestArgs, archive: &Path, solutions: &Path, build_dir: &Pa
         return Ok(());
     }
 
-    let solution = runner::discover(
-        solutions,
-        build_dir,
-        args.year,
-        args.day,
-        args.cmd.as_deref(),
-    )?;
+    let solution = runner::discover(solutions, build_dir, id.year, id.day, args.cmd.as_deref())?;
 
     let mut results = Vec::new();
     let mut failures = 0usize;
     for test in &tests {
-        let outcome = runner::execute(&solution, args.year, args.day, test.part, &test.input)?;
-        let actual = outcome.stdout.trim().to_string();
+        let outcome = runner::execute(&solution, id.year, id.day, test.part, &test.input)?;
+        let actual = answer_from_stdout(&outcome.stdout)
+            .unwrap_or("")
+            .to_string();
         let expected = test.expected.trim().to_string();
         let passed = outcome.success && actual == expected;
         if !passed {
@@ -612,13 +1082,7 @@ fn test_command(args: TestArgs, archive: &Path, solutions: &Path, build_dir: &Pa
             .collect();
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!(
-            "{}/{:02} {} — {} test(s)",
-            args.year,
-            args.day,
-            puzzle.title,
-            tests.len()
-        );
+        println!("{} {} — {} test(s)", id, puzzle.title, tests.len());
         println!();
         for (test, actual, outcome, passed) in &results {
             if *passed {
@@ -656,103 +1120,189 @@ fn test_command(args: TestArgs, archive: &Path, solutions: &Path, build_dir: &Pa
 }
 
 fn run_command(args: RunArgs, archive: &Path, solutions: &Path, build_dir: &Path) -> Result<()> {
-    if !(1..=2).contains(&args.part) {
-        bail!("--part must be 1 or 2");
+    if args.examples {
+        return run_examples(&args, archive, solutions, build_dir);
     }
 
-    let puzzle = load_puzzle(archive, args.year, args.day)?;
-    let input_path = find_input(archive, TaskId::new(args.year, args.day)).with_context(|| {
-        format!(
-            "no puzzle input for {}/{:02}\n\
-             Put it at {} (e.g. `harness init {} {} --input path/to/input.txt`),\n\
-             or set AOC_SESSION and run `harness scrape --years {} --refresh`.",
-            args.year,
-            args.day,
-            scrape::puzzle_dir(archive, args.year, args.day)
-                .join("input.txt")
-                .display(),
-            args.year,
-            args.day,
-            args.year
-        )
-    })?;
+    let id = args.day;
+    match args.part.explicit() {
+        Some(part) => ensure_part(archive, id, part)?,
+        None => ensure_part(archive, id, 1)?,
+    }
+    let puzzle = load_puzzle(archive, id.year, id.day)?;
+    let parts = run_parts(args.part, archive, id, &puzzle)?;
+
+    let input_path = match find_input(archive, id) {
+        Some(path) => path,
+        None if session_cookie_optional().is_none() => {
+            return Err(usage(format!(
+                "no input for {id} and no AOC_SESSION to fetch it; run `harness input {id} --file <path>`"
+            )));
+        }
+        None => bail!(
+            "no puzzle input for {id}; run `harness scrape {id}` with AOC_SESSION or `harness input {id} --file <path>`"
+        ),
+    };
     let input = fs::read_to_string(&input_path)
         .with_context(|| format!("reading {}", input_path.display()))?;
 
-    let solution = runner::discover(
-        solutions,
-        build_dir,
-        args.year,
-        args.day,
-        args.cmd.as_deref(),
-    )?;
-    let outcome = runner::execute(&solution, args.year, args.day, args.part, &input)?;
+    let solution = runner::discover(solutions, build_dir, id.year, id.day, args.cmd.as_deref())?;
 
-    let answer = outcome.stdout.trim().to_string();
-    let archived = puzzle
-        .answers
-        .get((args.part - 1) as usize)
-        .and_then(|answer| answer.as_deref());
-    let matches = archived.map(|expected| expected.trim() == answer);
+    let mut results = Vec::new();
+    let mut any_failed = false;
+    for part in parts {
+        let outcome = runner::execute(&solution, id.year, id.day, part, &input)?;
+        let answer = answer_from_stdout(&outcome.stdout)
+            .unwrap_or("")
+            .to_string();
+        let recorded = recorded_answer(archive, &puzzle, part);
+        let matches = recorded
+            .as_deref()
+            .map(|expected| expected.trim() == answer);
+        if !outcome.success {
+            any_failed = true;
+        }
+        results.push(PartRun {
+            part,
+            answer,
+            recorded,
+            matches,
+            success: outcome.success,
+            stderr: outcome.stderr,
+            millis: outcome.elapsed.as_millis() as u64,
+        });
+    }
 
     if args.json {
+        let payload: Vec<_> = results
+            .iter()
+            .map(|result| {
+                serde_json::json!({
+                    "part": result.part,
+                    "answer": result.answer,
+                    "recorded_answer": result.recorded,
+                    "matches_recorded": result.matches,
+                    "success": result.success,
+                    "stderr": result.stderr.trim(),
+                    "millis": result.millis,
+                })
+            })
+            .collect();
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "part": args.part,
-                "answer": answer,
-                "archived_answer": archived,
-                "matches_archive": matches,
-                "success": outcome.success,
-                "stderr": outcome.stderr.trim(),
-                "millis": outcome.elapsed.as_millis() as u64,
+                "year": id.year,
+                "day": id.day,
+                "parts": payload,
             }))?
         );
     } else {
-        if outcome.success {
-            println!(
-                "{}/{:02} part {}: {}  ({} ms)",
-                args.year,
-                args.day,
-                args.part,
-                if answer.is_empty() {
-                    "<no output>"
-                } else {
-                    &answer
-                },
-                outcome.elapsed.as_millis()
-            );
-        } else {
-            println!(
-                "{}/{:02} part {} failed after {} ms",
-                args.year,
-                args.day,
-                args.part,
-                outcome.elapsed.as_millis()
-            );
-        }
-        if !outcome.stderr.trim().is_empty() {
-            for line in outcome.stderr.trim().lines().take(10) {
-                eprintln!("  {line}");
+        for result in &results {
+            if result.success {
+                println!(
+                    "{id} part {}: {}  ({} ms)",
+                    result.part,
+                    if result.answer.is_empty() {
+                        "<no output>"
+                    } else {
+                        &result.answer
+                    },
+                    result.millis
+                );
+            } else {
+                println!(
+                    "{id} part {} failed after {} ms",
+                    result.part, result.millis
+                );
             }
-        }
-        match matches {
-            Some(true) => println!("  matches the archived answer"),
-            Some(false) => println!(
-                "  does not match the archived answer ({})",
-                archived.unwrap_or("")
-            ),
-            None => {}
+            if !result.stderr.trim().is_empty() {
+                for line in result.stderr.trim().lines().take(10) {
+                    eprintln!("  {line}");
+                }
+            }
+            match result.matches {
+                Some(true) => println!("  matches the recorded answer"),
+                Some(false) => println!(
+                    "  does not match the recorded answer ({})",
+                    result.recorded.as_deref().unwrap_or("")
+                ),
+                None => {}
+            }
         }
     }
 
-    if !outcome.success {
+    if any_failed {
         std::process::exit(1);
     }
     Ok(())
 }
 
+struct PartRun {
+    part: u8,
+    answer: String,
+    recorded: Option<String>,
+    matches: Option<bool>,
+    success: bool,
+    stderr: String,
+    millis: u64,
+}
+
+/// Resolve `--part` to concrete Parts. An explicit Part must be available; `all`
+/// means every captured Part.
+fn run_parts(
+    selector: PartSelector,
+    archive: &Path,
+    id: TaskId,
+    puzzle: &aoc_archive::model::Puzzle,
+) -> Result<Vec<u8>> {
+    match selector.explicit() {
+        Some(part) => {
+            ensure_part(archive, id, part)?;
+            Ok(vec![part])
+        }
+        None => {
+            let parts: Vec<u8> = puzzle
+                .parts
+                .iter()
+                .map(|part| part.number)
+                .filter(|part| selector.includes(*part))
+                .collect();
+            if parts.is_empty() {
+                bail!("no Part of {id} is in the archive; run `harness scrape {id}`");
+            }
+            Ok(parts)
+        }
+    }
+}
+
+fn recorded_answer(
+    archive: &Path,
+    puzzle: &aoc_archive::model::Puzzle,
+    part: u8,
+) -> Option<String> {
+    let path = scrape::puzzle_dir(archive, puzzle.year, puzzle.day).join("answers.json");
+    if let Ok(text) = fs::read_to_string(path)
+        && let Ok(answers) = serde_json::from_str::<BTreeMap<String, String>>(&text)
+        && let Some(answer) = answers.get(&part.to_string())
+    {
+        return Some(answer.clone());
+    }
+    puzzle
+        .answers
+        .get((part - 1) as usize)
+        .and_then(|answer| answer.clone())
+}
+
+fn recorded_answer_for(archive: &Path, id: TaskId, part: u8) -> Option<String> {
+    let puzzle = load_puzzle(archive, id.year, id.day).ok()?;
+    recorded_answer(archive, &puzzle, part)
+}
+
 fn next_command(args: NextArgs, archive: &Path, solutions: &Path, build_dir: &Path) -> Result<()> {
+    if !has_remote_state(archive) {
+        warning("no cached site state: cannot tell a Recorded Day from one already Solved");
+    }
+
     let local = ArchiveAoc::new(
         archive.to_path_buf(),
         solutions.to_path_buf(),
@@ -762,12 +1312,12 @@ fn next_command(args: NextArgs, archive: &Path, solutions: &Path, build_dir: &Pa
     let next = tasks
         .iter()
         .filter(|task| args.year.is_none_or(|year| year == task.id.year))
-        .filter(|task| task.solved.len() < task.parts as usize)
+        .filter(|task| task.recorded.len() < task.parts as usize)
         .min_by_key(|task| (!task.has_input, task.id.year, task.id.day));
 
     let Some(task) = next else {
         bail!(
-            "every captured part is solved{}",
+            "every captured Part is Recorded{}",
             args.year
                 .map(|year| format!(" for {year}"))
                 .unwrap_or_default()
@@ -788,9 +1338,53 @@ fn next_command(args: NextArgs, archive: &Path, solutions: &Path, build_dir: &Pa
                 "no input"
             }
         );
-        println!("run: harness solve {} {}", task.id.year, task.id.day);
+        println!("run: harness solve {}", task.id);
     }
     Ok(())
+}
+
+fn has_remote_state(archive: &Path) -> bool {
+    scrape::available_years(archive).iter().any(|year| {
+        year.days
+            .iter()
+            .any(|day| RemoteDayState::load(archive, year.year, day.day).is_some())
+    })
+}
+
+fn build_model(args: &SolveArgs) -> Result<OpenAiModel> {
+    let mut model = OpenAiModel::from_env(args.model.as_deref(), args.base_url.as_deref())?
+        .with_timeout(Duration::from_secs(args.timeout));
+    if args.max_tokens > 0 {
+        model = model.with_max_tokens(args.max_tokens);
+    }
+    if !args.quiet {
+        eprintln!(
+            "model {} via {} (timeout {}s, max tokens: {})",
+            model.name(),
+            model.base_url(),
+            args.timeout,
+            if args.max_tokens == 0 {
+                "provider default".to_string()
+            } else {
+                args.max_tokens.to_string()
+            }
+        );
+    }
+    Ok(model)
+}
+
+fn run_agent<A: Aoc, M: Model>(
+    aoc: &A,
+    id: TaskId,
+    args: &SolveArgs,
+    model: &M,
+    submit: bool,
+    emit: &mut dyn FnMut(&AgentEvent),
+) -> Result<SolveReport> {
+    let agent = Agent::new(aoc, model, args.turns);
+    let agent = if args.quiet { agent.quiet() } else { agent };
+    let agent = if submit { agent.with_submit() } else { agent };
+    agent.solve_parts(id, args.part, emit)
 }
 
 fn solve_command(
@@ -799,78 +1393,271 @@ fn solve_command(
     solutions: &Path,
     build_dir: &Path,
 ) -> Result<()> {
-    if !(1..=25).contains(&args.day) {
-        bail!("day must be within 1-25");
-    }
     if args.turns == 0 {
-        bail!("--turns must be at least 1");
+        return Err(usage("--turns must be at least 1"));
     }
     if args.timeout == 0 {
-        bail!("--timeout must be at least 1 second");
+        return Err(usage("--timeout must be at least 1 second"));
     }
 
-    let local = ArchiveAoc::new(
+    let id = args.day;
+    let cookie = session_cookie_optional();
+    let replay = args.replay.as_deref();
+    let submit = if args.submit {
+        true
+    } else if args.no_submit {
+        false
+    } else {
+        SUBMIT_BY_DEFAULT
+    } && replay.is_none();
+
+    if submit && cookie.is_none() {
+        return Err(usage(
+            "--submit needs AOC_SESSION; set it in .env, or drop --submit to record only",
+        ));
+    }
+
+    if let Some(value) = &args.wait {
+        wait_for_day(id, parse_duration(value)?)?;
+    }
+
+    // A Day the site has not reached can never be fetched or solved.
+    let mut part1 = part_availability(archive, id, 1);
+    if part1 == PartAvailability::Unreleased {
+        return Err(usage(
+            part1
+                .error(id, 1)
+                .unwrap_or_else(|| "day is not available".into()),
+        ));
+    }
+
+    // A replay run never fetches, so its Day must already be Captured.
+    if replay.is_some() && part1 != PartAvailability::Available {
+        return Err(usage(format!(
+            "{}; a replay run never fetches, so scrape it first",
+            part1
+                .error(id, 1)
+                .unwrap_or_else(|| "day is not available".into())
+        )));
+    }
+
+    if cookie.is_none()
+        && args.part.includes(2)
+        && part_availability(archive, id, 2) != PartAvailability::Available
+    {
+        warning("no AOC_SESSION: Part Two cannot be unsealed; this run stops after Part One");
+    }
+
+    let remote = RemoteAoc::new(
         archive.to_path_buf(),
         solutions.to_path_buf(),
         build_dir.to_path_buf(),
+        cookie.clone(),
+        Duration::from_secs_f64(1.1),
     );
-    let id = TaskId::new(args.year, args.day);
 
-    let mut emit = |event: &AgentEvent| {
-        if args.events {
-            match serde_json::to_string(event) {
-                Ok(line) => eprintln!("{line}"),
-                Err(err) => tracing::warn!(%err, "could not serialize agent event"),
+    if replay.is_none() {
+        remote.ensure_day(id)?;
+        part1 = part_availability(archive, id, 1);
+    }
+
+    if !submit && args.part.explicit() == Some(2) {
+        ensure_part(archive, id, 2)?;
+    }
+    if part1 != PartAvailability::Available {
+        let message = part1
+            .error(id, 1)
+            .unwrap_or_else(|| "day is not available".into());
+        return Err(usage(message));
+    }
+    if find_input(archive, id).is_none() {
+        if cookie.is_none() {
+            return Err(usage(format!(
+                "no input for {id} and no AOC_SESSION to fetch it; run `harness input {id} --file <path>`"
+            )));
+        }
+        return Err(usage(format!(
+            "no input for {id}; run `harness input {id} --file <path>`"
+        )));
+    }
+
+    // A submit-enabled run reads the calendar once before turn one, so the
+    // Open Part reflects a Part solved outside the harness. The site is never
+    // asked again during a tool call.
+    let mut remote_state = remote.state(id)?;
+    if submit {
+        let (state, _) = remote
+            .verify_star(id)
+            .with_context(|| format!("reading the calendar for {id}"))?;
+        remote_state = state;
+
+        // If Part Two is the Open Part and selected but its statement was
+        // never captured, fetch it before the model can work.
+        if args.part.includes(2) && open_part(&remote_state) == Some(2) {
+            let captured = load_puzzle(archive, id.year, id.day)
+                .map(|puzzle| puzzle.parts.iter().any(|part| part.number == 2))
+                .unwrap_or(false);
+            if !captured {
+                remote_state = remote.ensure_day(id)?;
             }
         }
+    }
+    let open = if submit {
+        open_part(&remote_state)
+    } else {
+        None
     };
 
-    let report = if let Some(replay) = &args.replay {
-        let model = ReplayModel::from_file(replay)?;
-        if !args.quiet {
-            eprintln!("replay: {}", replay.display());
+    // `--part 2` is impossible until the site accepts Part One.
+    if submit && args.part.explicit() == Some(2) && open == Some(1) {
+        return Err(usage("part 2 is sealed; submit part 1 first"));
+    }
+    if submit
+        && let Some(part) = open
+        && args.part.includes(part)
+    {
+        ensure_part(archive, id, part)?;
+    }
+
+    let puzzle = load_puzzle(archive, id.year, id.day)?;
+    let captured: Vec<u8> = puzzle
+        .parts
+        .iter()
+        .map(|part| part.number)
+        .filter(|part| args.part.includes(*part))
+        .collect();
+    let selected: Vec<u8> = (1u8..=2).filter(|part| args.part.includes(*part)).collect();
+
+    let (target_parts, needs_model) = if submit {
+        match open {
+            Some(part) if args.part.includes(part) => (vec![part], true),
+            _ => (selected.clone(), false),
         }
-        let agent = Agent::new(&local, &model, args.turns);
-        (if args.quiet { agent.quiet() } else { agent }).solve_with(id, &mut emit)?
     } else {
-        let mut model = OpenAiModel::from_env(args.model.as_deref(), args.base_url.as_deref())?
-            .with_timeout(Duration::from_secs(args.timeout));
-        if args.max_tokens > 0 {
-            model = model.with_max_tokens(args.max_tokens);
-        }
-        if !args.quiet {
-            eprintln!(
-                "model {} via {} (timeout {}s, max tokens: {})",
-                model.name(),
-                model.base_url(),
-                args.timeout,
-                if args.max_tokens == 0 {
-                    "provider default".to_string()
-                } else {
-                    args.max_tokens.to_string()
-                }
-            );
-        }
-        let agent = Agent::new(&local, &model, args.turns);
-        (if args.quiet { agent.quiet() } else { agent }).solve_with(id, &mut emit)?
+        let recorded = recorded_parts(archive, id);
+        let needs_model = captured.iter().any(|part| !recorded.contains(part));
+        (captured, needs_model)
     };
+
+    let report = if needs_model {
+        let mut emit = |event: &AgentEvent| {
+            if args.events {
+                match serde_json::to_string(event) {
+                    Ok(line) => eprintln!("{line}"),
+                    Err(err) => tracing::warn!(%err, "could not serialize agent event"),
+                }
+            }
+        };
+
+        let local = ArchiveAoc::new(
+            archive.to_path_buf(),
+            solutions.to_path_buf(),
+            build_dir.to_path_buf(),
+        );
+        if let Some(path) = replay {
+            let model = ReplayModel::from_file(path)?;
+            if submit {
+                run_agent(&remote, id, &args, &model, submit, &mut emit)?
+            } else {
+                run_agent(&local, id, &args, &model, submit, &mut emit)?
+            }
+        } else {
+            let model = build_model(&args)?;
+            if submit {
+                run_agent(&remote, id, &args, &model, submit, &mut emit)?
+            } else {
+                run_agent(&local, id, &args, &model, submit, &mut emit)?
+            }
+        }
+    } else {
+        // Nothing left to do: no model turn is needed.
+        let runs = target_parts
+            .iter()
+            .filter_map(|&part| {
+                recorded_answer_for(archive, id, part).map(|answer| RunReport {
+                    part,
+                    answer,
+                    stderr: String::new(),
+                    success: true,
+                    millis: 0,
+                    verdict: Verdict::Unverified,
+                })
+            })
+            .collect();
+        let note = if !submit && args.part.includes(2) && !target_parts.contains(&2) {
+            Some("part 2 is sealed; re-run with --submit".to_string())
+        } else {
+            None
+        };
+        let recorded = recorded_parts(archive, id)
+            .into_iter()
+            .filter(|part| target_parts.contains(part))
+            .collect();
+        SolveReport {
+            id,
+            turns: 0,
+            verified: false,
+            tests: TestReport { cases: Vec::new() },
+            runs,
+            recorded,
+            submissions: Vec::new(),
+            history: Vec::new(),
+            note,
+        }
+    };
+
+    let star = if submit {
+        match remote.verify_star(id) {
+            Ok(state) => Some(state),
+            Err(err) => {
+                warning(&format!(
+                    "could not verify the star on the calendar: {err:#}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let remote_state = remote.state(id).ok();
+    let solved = star.as_ref().is_some_and(|(_, confirmed)| *confirmed);
+    // Exit 0 with --submit only when the site accepted every selected Part;
+    // the calendar may still lag behind the acceptance.
+    let accepted = submit
+        && selected.iter().all(|part| match part {
+            1 => remote_state
+                .as_ref()
+                .is_some_and(|state| state.part1.solved),
+            2 => remote_state
+                .as_ref()
+                .is_some_and(|state| state.part2.solved),
+            _ => false,
+        });
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let payload = serde_json::json!({
+            "report": &report,
+            "remote": &remote_state,
+            "star_confirmed": star.as_ref().map(|(_, confirmed)| *confirmed),
+            "accepted": accepted,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        if submit && !accepted {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
-    let verified = report.verified
-        || report
-            .runs
-            .iter()
-            .any(|run| run.verdict == Verdict::Correct);
-    println!(
-        "{} {} in {} turn(s)",
-        if verified { "solved" } else { "finished" },
-        id,
-        report.turns
-    );
+    let headline = if solved {
+        "solved"
+    } else if accepted {
+        "accepted, star unconfirmed"
+    } else {
+        "recorded"
+    };
+    println!("{headline} {id} in {} turn(s)", report.turns);
+
     if !report.history.is_empty() {
         println!("turn timings:");
         for turn in &report.history {
@@ -890,14 +1677,16 @@ fn solve_command(
             );
         }
     }
-    if report.verified {
-        println!(
-            "example tests: {}/{} passed",
-            report.tests.passed(),
-            report.tests.cases.len()
-        );
-    } else {
-        println!("warning: no example tests were available; the answer is unverified");
+    if report.turns > 0 {
+        if report.verified {
+            println!(
+                "example tests: {}/{} passed",
+                report.tests.passed(),
+                report.tests.cases.len()
+            );
+        } else {
+            warning("no example tests were available; the answer is unverified");
+        }
     }
     for run in &report.runs {
         println!(
@@ -906,10 +1695,16 @@ fn solve_command(
             run.answer,
             run.millis,
             match run.verdict {
-                Verdict::Correct => "matches archived answer",
-                Verdict::Incorrect => "does NOT match archived answer",
-                Verdict::Unverified => "recorded, no archived answer",
+                Verdict::Correct => "matches the recorded answer",
+                Verdict::Incorrect => "does NOT match the recorded answer",
+                Verdict::Unverified => "recorded, no known answer",
             }
+        );
+    }
+    for submission in &report.submissions {
+        println!(
+            "submit part {}: {} — {}",
+            submission.part, submission.status, submission.message
         );
     }
     if !report.recorded.is_empty() {
@@ -926,14 +1721,35 @@ fn solve_command(
     if let Some(note) = &report.note {
         println!("note: {note}");
     }
+    if let Some((state, _)) = &star {
+        println!(
+            "remote: {} star(s); part 1 {}; part 2 {}",
+            state.stars,
+            if state.part1.solved {
+                "solved"
+            } else {
+                "unsolved"
+            },
+            if state.part2.solved {
+                "solved"
+            } else if state.part2_unlocked {
+                "unlocked, unsolved"
+            } else {
+                "locked"
+            },
+        );
+    }
     println!(
         "code: {}",
         solutions
-            .join(args.year.to_string())
-            .join(format!("{:02}", args.day))
+            .join(id.year.to_string())
+            .join(format!("{:02}", id.day))
             .join("solve.rs")
             .display()
     );
+    if submit && !accepted {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -966,81 +1782,14 @@ fn truncate(text: &str, width: usize) -> String {
     out
 }
 
-fn parse_years(spec: &str) -> Result<Vec<u32>> {
-    let mut years = Vec::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some((from, to)) = part.split_once('-') {
-            let from: u32 = from.trim().parse().context("invalid year range start")?;
-            let to: u32 = to.trim().parse().context("invalid year range end")?;
-            if from > to {
-                bail!("invalid year range {from}-{to}");
-            }
-            years.extend(from..=to);
-        } else {
-            years.push(part.parse().context("invalid year")?);
-        }
-    }
-    years.sort_unstable();
-    years.dedup();
-    if years.is_empty() {
-        bail!("no years given");
-    }
-    Ok(years)
-}
-
-fn parse_days(spec: &str) -> Result<Option<(u32, u32)>> {
-    let spec = spec.trim();
-    if spec == "all" || spec == "1-25" {
-        return Ok(None);
-    }
-    let (from, to) = match spec.split_once('-') {
-        Some((from, to)) => (from.trim(), to.trim()),
-        None => (spec, spec),
-    };
-    let from: u32 = from.parse().context("invalid day")?;
-    let to: u32 = to.parse().context("invalid day")?;
-    if from == 0 || to > 25 || from > to {
-        bail!("day range must be within 1-25, got {spec}");
-    }
-    Ok(Some((from, to)))
-}
-
 fn default_years() -> Vec<u32> {
-    let (year, month) = current_year_month();
+    let (year, month) = aoc::current_year_month();
     let last = if month >= 12 {
         year
     } else {
         year.saturating_sub(1)
     };
     (2015..=last.max(2015)).collect()
-}
-
-fn current_year_month() -> (u32, u32) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let days = secs.div_euclid(86_400);
-    let (year, month, _) = civil_from_days(days);
-    (year as u32, month)
-}
-
-/// Howard Hinnant's civil_from_days, without pulling in a date crate.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 const RUST_TEMPLATE: &str = r#"use std::io::{self, Read};

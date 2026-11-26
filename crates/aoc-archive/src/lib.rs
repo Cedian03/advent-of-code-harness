@@ -7,6 +7,7 @@
 pub mod client;
 pub mod html;
 pub mod model;
+pub mod remote;
 pub mod scrape;
 
 pub use model::{DayEntry, Example, Part, Puzzle, RootIndex, YearIndex};

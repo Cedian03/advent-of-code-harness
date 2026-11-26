@@ -58,6 +58,20 @@ impl Fetcher {
         )
     }
 
+    pub fn calendar_fresh(&mut self, year: u32) -> Result<String> {
+        let path = self
+            .cache_dir
+            .join("raw")
+            .join(year.to_string())
+            .join("calendar.html");
+        self.get_cached_with_ttl(
+            &format!("{BASE_URL}/{year}"),
+            &path,
+            Some(Duration::from_secs(3600)),
+            true,
+        )
+    }
+
     pub fn day(&mut self, year: u32, day: u32) -> Result<String> {
         let path = self
             .cache_dir
@@ -76,6 +90,47 @@ impl Fetcher {
             .join(year.to_string())
             .join(format!("day-{day:02}.html"));
         self.get_cached_with_ttl(&format!("{BASE_URL}/{year}/day/{day}"), &path, None, true)
+    }
+
+    /// Submit an answer for a part. Only works with a session cookie.
+    pub fn submit_answer(
+        &mut self,
+        year: u32,
+        day: u32,
+        level: u8,
+        answer: &str,
+    ) -> Result<String> {
+        let cookie = self
+            .cookie
+            .clone()
+            .context("submitting answers requires AOC_SESSION")?;
+        let url = format!("{BASE_URL}/{year}/day/{day}/answer");
+        let body = format!("level={level}&answer={}", form_encode(answer));
+
+        self.throttle();
+        debug!(%url, level, "submitting answer");
+
+        let mut response = self
+            .agent
+            .post(&url)
+            .header("User-Agent", USER_AGENT)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "text/html")
+            .header("Cookie", cookie)
+            .send(body)
+            .with_context(|| format!("posting answer to {url}"))?;
+
+        let status = response.status().as_u16();
+        let text = response
+            .body_mut()
+            .read_to_string()
+            .with_context(|| format!("reading submission response from {url}"))?;
+
+        if status != 200 {
+            bail!("submission to {url} returned HTTP {status}");
+        }
+        debug!(%url, status, bytes = text.len(), "submission response");
+        Ok(text)
     }
 
     /// Puzzle inputs are personal, so this only works with a session cookie.
@@ -201,6 +256,20 @@ impl Fetcher {
         }
         self.last_request = Some(Instant::now());
     }
+}
+
+fn form_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn is_retryable(status: u16) -> bool {

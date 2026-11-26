@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,7 +12,9 @@ use crate::model::{Puzzle, RootIndex, YearIndex};
 
 pub struct ScrapeOptions {
     pub years: Vec<u32>,
-    pub days: Option<(u32, u32)>,
+    /// Exact `(year, day)` pairs to visit, or `None` for every Day of `years`.
+    /// A Selection arrives here already deduplicated and sorted.
+    pub days: Option<BTreeSet<(u32, u32)>>,
     pub out_dir: PathBuf,
     pub delay: Duration,
     pub refresh: bool,
@@ -30,17 +33,6 @@ pub fn run(opts: &ScrapeOptions) -> Result<RootIndex> {
         opts.delay,
         opts.refresh,
     );
-
-    if fetcher.authenticated() {
-        eprintln!(
-            "Session cookie found: Part Two, puzzle inputs, and previously submitted answers will be captured."
-        );
-    } else {
-        eprintln!(
-            "No session cookie: capturing public Part One statements only (no inputs, Part Two hidden by AoC)."
-        );
-        eprintln!("Set AOC_SESSION to include your inputs and any solved Part Twos.\n");
-    }
 
     for &year in &opts.years {
         if let Err(err) = scrape_year(&mut fetcher, year, opts) {
@@ -67,8 +59,8 @@ fn scrape_year(fetcher: &mut Fetcher, year: u32, opts: &ScrapeOptions) -> Result
         .map(|entry| entry.day)
         .collect::<Vec<_>>()
     {
-        if let Some((from, to)) = opts.days
-            && (day < from || day > to)
+        if let Some(days) = &opts.days
+            && !days.contains(&(year, day))
         {
             continue;
         }

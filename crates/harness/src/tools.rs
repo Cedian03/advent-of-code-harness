@@ -6,7 +6,8 @@ use llm_http::ToolDefinition;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::aoc::{Aoc, TaskId, TestReport, Verdict};
+use crate::aoc::{Aoc, RunReport, SubmitReport, SubmitStatus, TaskId, TestReport, Verdict};
+use crate::part::PartSelector;
 
 const MAX_FILE_CHARS: usize = 40_000;
 const MAX_INPUT_CHARS: usize = 12_000;
@@ -17,6 +18,7 @@ pub struct ToolContext<'a> {
     pub id: TaskId,
     pub workspace: PathBuf,
     pub input: Option<&'a str>,
+    pub selector: PartSelector,
 }
 
 pub trait Tool {
@@ -30,18 +32,22 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    pub fn default_set() -> Self {
-        Self {
-            tools: vec![
-                Box::new(ReadFile),
-                Box::new(WriteFile),
-                Box::new(EditFile),
-                Box::new(ListFiles),
-                Box::new(ReadInput),
-                Box::new(RunTests),
-                Box::new(RunPart),
-            ],
+    /// Submit tools exist only when the invocation is submit-enabled.
+    pub fn default_set(submit: bool) -> Self {
+        let mut tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ReadFile),
+            Box::new(WriteFile),
+            Box::new(EditFile),
+            Box::new(ListFiles),
+            Box::new(ReadInput),
+            Box::new(RunTests),
+            Box::new(RunPart),
+        ];
+        if submit {
+            tools.push(Box::new(Submit));
+            tools.push(Box::new(RunAndSubmit));
         }
+        Self { tools }
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -307,12 +313,7 @@ struct RunPart;
 
 #[derive(Deserialize)]
 struct RunPartArgs {
-    #[serde(default = "one")]
     part: u8,
-}
-
-fn one() -> u8 {
-    1
 }
 
 impl Tool for RunPart {
@@ -327,14 +328,16 @@ impl Tool for RunPart {
             json!({
                 "type": "object",
                 "properties": {
-                    "part": {"type": "integer", "enum": [1, 2], "default": 1}
-                }
+                    "part": {"type": "integer", "enum": [1, 2]}
+                },
+                "required": ["part"]
             }),
         )
     }
 
     fn execute(&self, ctx: &ToolContext<'_>, args: Value) -> Result<String> {
-        let args: RunPartArgs = serde_json::from_value(args).unwrap_or(RunPartArgs { part: 1 });
+        let args: RunPartArgs =
+            serde_json::from_value(args).context("invalid run_part arguments")?;
         if !(1..=2).contains(&args.part) {
             bail!("part must be 1 or 2");
         }
@@ -357,6 +360,173 @@ impl Tool for RunPart {
             }
         }
         Ok(out)
+    }
+}
+
+struct Submit;
+
+#[derive(Deserialize)]
+struct SubmitArgs {
+    part: u8,
+    answer: String,
+}
+
+impl Tool for Submit {
+    fn name(&self) -> &'static str {
+        "submit"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            self.name(),
+            "Post one explicit answer for the Open Part to adventofcode.com.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "part": {"type": "integer", "enum": [1, 2]},
+                    "answer": {"type": "string", "description": "The answer to post"}
+                },
+                "required": ["part", "answer"]
+            }),
+        )
+    }
+
+    fn execute(&self, ctx: &ToolContext<'_>, args: Value) -> Result<String> {
+        let args: SubmitArgs = serde_json::from_value(args).context("invalid submit arguments")?;
+        ensure_submittable(ctx, args.part)?;
+        let answer = args.answer.trim();
+        if answer.is_empty() {
+            bail!("answer is empty");
+        }
+        submit_answer(ctx, args.part, answer)
+    }
+}
+
+struct RunAndSubmit;
+
+#[derive(Deserialize)]
+struct RunAndSubmitArgs {
+    part: u8,
+}
+
+impl Tool for RunAndSubmit {
+    fn name(&self) -> &'static str {
+        "run_and_submit"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            self.name(),
+            "Run solve.rs on the real input for the Open Part and post its answer if eligible.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "part": {"type": "integer", "enum": [1, 2]}
+                },
+                "required": ["part"]
+            }),
+        )
+    }
+
+    fn execute(&self, ctx: &ToolContext<'_>, args: Value) -> Result<String> {
+        let args: RunAndSubmitArgs =
+            serde_json::from_value(args).context("invalid run_and_submit arguments")?;
+        ensure_submittable(ctx, args.part)?;
+
+        let run = ctx.aoc.run_file(ctx.id, args.part)?;
+        if !run.success {
+            return Ok(not_submitted_run(
+                args.part,
+                "process exited unsuccessfully",
+                &run,
+            ));
+        }
+        if run.answer.is_empty() {
+            return Ok(not_submitted_run(args.part, "no answer on stdout", &run));
+        }
+        if run.verdict == Verdict::Incorrect {
+            return Ok(not_submitted_run(
+                args.part,
+                "answer is known incorrect",
+                &run,
+            ));
+        }
+        if ctx.aoc.is_rejected(ctx.id, args.part, &run.answer) {
+            return Ok(not_submitted_run(
+                args.part,
+                "answer was rejected earlier",
+                &run,
+            ));
+        }
+        submit_answer(ctx, args.part, &run.answer)
+    }
+}
+
+/// Reject a Submit before any process runs or request is made.
+fn ensure_submittable(ctx: &ToolContext<'_>, part: u8) -> Result<()> {
+    if !(1..=2).contains(&part) {
+        bail!("part must be 1 or 2");
+    }
+    if !ctx.selector.includes(part) {
+        bail!(
+            "part {part} is not included by --part {}",
+            ctx.selector.label()
+        );
+    }
+    match ctx.aoc.open_part(ctx.id)? {
+        Some(open) if open == part => Ok(()),
+        Some(1) if part == 2 => bail!("part 2 is sealed; the Open Part is 1"),
+        Some(open) => bail!("part {part} is not the Open Part; the Open Part is {open}"),
+        None => bail!("part {part} is not the Open Part; the Day has no unsolved Part"),
+    }
+}
+
+fn submit_answer(ctx: &ToolContext<'_>, part: u8, answer: &str) -> Result<String> {
+    let verdict = ctx.aoc.verdict(ctx.id, part, answer);
+    if verdict == Verdict::Incorrect {
+        return Ok(not_submitted(part, "answer is known incorrect"));
+    }
+    if ctx.aoc.is_rejected(ctx.id, part, answer) {
+        return Ok(not_submitted(part, "answer was rejected earlier"));
+    }
+    let report = ctx.aoc.submit(ctx.id, part, answer)?;
+    Ok(format_submit(part, &report))
+}
+
+fn not_submitted(part: u8, reason: &str) -> String {
+    format!("part {part}: not submitted: {reason}")
+}
+
+fn not_submitted_run(part: u8, reason: &str, run: &RunReport) -> String {
+    let mut out = not_submitted(part, reason);
+    if !run.answer.is_empty() {
+        out.push_str(&format!("\nanswer: `{}`", run.answer));
+    }
+    if !run.stderr.trim().is_empty() {
+        out.push_str("\nstderr:\n");
+        for line in run.stderr.trim().lines().take(6) {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn format_submit(part: u8, report: &SubmitReport) -> String {
+    match report.status {
+        SubmitStatus::Accepted => format!("part {part}: accepted — {}", report.message),
+        SubmitStatus::Rejected => format!("part {part}: rejected — {}", report.message),
+        SubmitStatus::TooSoon { wait_seconds } => {
+            let wait = wait_seconds
+                .map(|seconds| format!(" (wait {seconds}s)"))
+                .unwrap_or_default();
+            format!("part {part}: too soon{wait} — {}", report.message)
+        }
+        SubmitStatus::WrongLevel => {
+            format!("part {part}: wrong level — {}", report.message)
+        }
+        SubmitStatus::Unknown => format!("part {part}: unknown — {}", report.message),
     }
 }
 
@@ -434,6 +604,24 @@ fn truncate(text: String, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submit_tools_exist_only_in_submit_runs() {
+        let names = |submit| {
+            ToolRegistry::default_set(submit)
+                .definitions()
+                .into_iter()
+                .map(|definition| definition.function.name)
+                .collect::<Vec<_>>()
+        };
+        let read_only = names(false);
+        assert!(!read_only.iter().any(|name| name == "submit"));
+        assert!(!read_only.iter().any(|name| name == "run_and_submit"));
+
+        let submitting = names(true);
+        assert!(submitting.iter().any(|name| name == "submit"));
+        assert!(submitting.iter().any(|name| name == "run_and_submit"));
+    }
 
     #[test]
     fn rejects_paths_outside_the_workspace() {

@@ -12,7 +12,7 @@ crates/
 ├── llm-http/      # library: minimal OpenAI-compatible chat client
 └── harness/       # main binary: archive + solve workflow
 .aoc/              # local puzzle cache (gitignored)
-solutions/         # one directory per solved day (yours to keep)
+solutions/         # one directory per solved day (gitignored, yours to keep)
 ```
 
 ## Architecture
@@ -21,8 +21,10 @@ Three seams keep the loop independent of where puzzles live and which model
 runs it:
 
 - **`Aoc` trait** (`crates/harness/src/aoc.rs`) — `tasks`, `load`, `evaluate`,
-  `run`, `submit`. `ArchiveAoc` implements it from the local `.aoc/` files;
-  `submit` only records answers, it never contacts AoC.
+  `run`, `record`, `open_part`, `submit`. `ArchiveAoc` implements it from local
+  files and only records answers; its `submit` refuses. `RemoteAoc` wraps it,
+  upgrades the archive with a Session when one is present, and overrides
+  `submit` only for a submit-enabled invocation.
 - **`Model` trait** (`crates/harness/src/model.rs`) — one streaming turn:
   text deltas plus any tool calls. `OpenAiModel` is a thin adapter over the
   `llm-http` crate; `ReplayModel` serves canned replies from a local JSON file
@@ -59,12 +61,24 @@ Do not commit `.aoc/` or use it to publish puzzle text or inputs.
 # Archive every past event (2015–2025; includes the current year in December)
 cargo run -p harness -- scrape
 
-# Coverage report
-cargo run -p harness -- status
+# Archive a single Day, or several Days/Events in one go
+cargo run -p harness -- scrape 2025/1
+cargo run -p harness -- scrape 2025 2024/3
 
-# See what a year looks like
-cargo run -p harness -- list --year 2024
+# Spans are the shell's job — there is no range syntax
+cargo run -p harness -- scrape 20{15..25}
+cargo run -p harness -- scrape 2025/{1..25}
+
+# One row per Event, or one row per Day when a Selection is given
+cargo run -p harness -- list
+cargo run -p harness -- list 2024 2025/1
 ```
+
+A Day is always fully qualified (`2025/1`), an Event is `2024`, and repeating
+addresses builds a **Selection**: duplicates collapse and Days run in ascending
+order. `scrape 2015-2025` is not an address; the error names the brace form
+above. PowerShell has no brace expansion, so write the span out there (or
+generate the addresses with a loop).
 
 ### Session cookie (optional)
 
@@ -80,7 +94,7 @@ environment, then scrape the day:
 # .env supports both "AOC_SESSION=..." and "export AOC_SESSION=..."
 echo 'AOC_SESSION=...' >> .env
 
-cargo run -p harness -- scrape --years 2025 --days 1
+cargo run -p harness -- scrape 2025/1
 ```
 
 The cookie is read at runtime and never written to disk. It also adds Part Two
@@ -94,19 +108,19 @@ fetched. Import yours instead — it goes to `.aoc/<year>/<day>/input.txt`
 
 ```sh
 # From a file
-cargo run -p harness -- input 2025 1 --file ~/aoc-inputs/2025-01.txt
+cargo run -p harness -- input 2025/1 --file ~/aoc-inputs/2025-01.txt
 
 # Or paste it and press Ctrl-D
-cargo run -p harness -- input 2025 1
+cargo run -p harness -- input 2025/1
 
 # One step while scaffolding a solution
-cargo run -p harness -- init 2025 1 --input ~/aoc-inputs/2025-01.txt
+cargo run -p harness -- init 2025/1 --input ~/aoc-inputs/2025-01.txt
 ```
 
 Import the bytes exactly as AoC gave them (keep the trailing newline). Verify
-with `harness status` / `harness list --year 2025`; the `Inputs` column should
-say `yes`. After that, `test` runs the examples and `solve`/`run` execute on
-the real input and verify against known answers.
+with `harness list 2025`; the `Inputs` column should say `yes`. After that,
+`run --examples` checks the examples and `solve`/`run` execute on the real input
+and compare against recorded answers.
 
 The full input is not pasted into the model prompt automatically: the generated
 program reads it from stdin, and the model can inspect it with `read_input`.
@@ -117,22 +131,85 @@ solve step like any other LLM interaction.
 
 ```sh
 # 1. Scaffold solutions/2024/01/solve.rs
-cargo run -p harness -- init 2024 1
+cargo run -p harness -- init 2024/1
 
 # 2. Read the statement (or grab the JSON task bundle)
-cargo run -p harness -- show 2024 1
-cargo run -p harness -- task 2024 1
+cargo run -p harness -- show 2024/1
+cargo run -p harness -- show 2024/1 --json
+cargo run -p harness -- show 2024/1 --part 2
 
 # 3. Edit solve.rs, then check it against the detected examples
-cargo run -p harness -- test 2024 1
+cargo run -p harness -- run 2024/1 --examples
 
 # 4. Run it on the real input
-cargo run -p harness -- run 2024 1
-cargo run -p harness -- run 2024 1 --part 2
+cargo run -p harness -- run 2024/1
+cargo run -p harness -- run 2024/1 --part all
 ```
+
+Every command addresses the same unit — the Day — as `YYYY/D`. A Part is a
+filter, not part of the address: `--part 1|2|all` (`run` defaults to part 1).
+Asking for a Part that is not available is an error: the Day is Unreleased,
+Part Two is Sealed until Part One is accepted, or the Part is simply not in the
+archive.
 
 `run` also compares the answer with the one AoC recorded for you, when the
 archive was scraped with a session.
+
+### Recording vs submitting
+
+There are no local/remote modes. `solve` reuses the archive, fetches only what is
+absent, and treats submission as a separate, opt-in capability.
+
+```sh
+harness solve 2025/1              # record answers locally (the default)
+harness solve 2025/1 --submit     # also post them to adventofcode.com
+harness solve 2025/1 --no-submit  # explicit record-only, even if the default changes
+```
+
+`--submit` requires `AOC_SESSION`. Without a Session, `solve` still works when the
+Day is already Captured and the input is present; it warns that Part Two cannot
+be unsealed. It errors when the input is missing and cannot be fetched.
+
+Wrong submissions follow AoC's cooldown; a `TooSoon` response is returned to the
+agent as a tool result with the remaining wait, and the loop continues. After a
+correct Part One the day page is refetched and Part Two is revealed **into the
+same agent session**: `solve.rs` and the conversation are kept, and the loop
+continues with a delta prompt instead of starting over. With `--submit`, the
+agent may call `submit` or `run_and_submit`; nothing is posted from a previous
+run's `answers.json`, rejected answers are remembered in `submissions.jsonl`,
+and the Star is verified on the calendar.
+
+`solve` covers both Parts by default (`--part all`). `--part 1` stops after Part
+One; `--part 2` requires Part Two to be available. A no-submit run that records
+Part One and stops prints `part 2 is sealed; re-run with --submit`.
+
+`--wait[=DUR]` holds until the Day is released (default ceiling 24h, e.g.
+`--wait 90m`). `scrape` accepts it too; both require exactly one Day.
+
+`--replay` implies `--no-submit` and never fetches, so the Day must already be
+Captured.
+
+Inspect cached Star state with `list`; `--stars` refreshes it from the site:
+
+```sh
+harness list                 # Stars column from remote.json, no network
+harness list 2025/1          # one Day
+harness list --stars         # refresh the calendar first; requires AOC_SESSION
+```
+
+Remote state is cached at `.aoc/<year>/<day>/remote.json`:
+
+```json
+{
+  "year": 2025,
+  "day": 1,
+  "stars": 1,
+  "part1": {"solved": true, "answer": "1078"},
+  "part2": {"solved": false, "answer": null},
+  "part2_unlocked": true,
+  "fetched_at": 1795646252
+}
+```
 
 ### Let a model solve it
 
@@ -141,10 +218,11 @@ archive was scraped with a session.
 cargo run -p harness -- next
 
 # .env in the repo root is loaded automatically (see .env.example)
-cargo run -p harness -- solve 2024 1
+cargo run -p harness -- solve 2024/1 --no-submit   # record locally
+cargo run -p harness -- solve 2024/1 --submit      # post to AoC (needs AOC_SESSION)
 
 # Offline: replay canned assistant replies from a local JSON file
-cargo run -p harness -- solve 2024 1 --replay /tmp/replies.json
+cargo run -p harness -- solve 2024/1 --replay /tmp/replies.json
 ```
 
 Each turn the model can call tools instead of dumping a whole file:
@@ -156,13 +234,15 @@ Each turn the model can call tools instead of dumping a whole file:
 | `read_input` | inspect your personal input (truncated; sent to the model) |
 | `run_tests` | compile `solve.rs` and run the detected examples |
 | `run_part` | run on the real input and get the answer |
+| `submit` / `run_and_submit` | with `--submit`: post an answer, or run and post if the run produced one |
 
 The loop streams the model, executes tool calls, appends each result as a tool
 message, and asks again. Paths are confined to the day's solution directory; there is no shell tool.
 When the model stops calling tools, the harness compiles and tests the file one
 last time; on success it runs the real input for every captured part, compares
 against answers already recorded for the account, and writes the answer to
-`.aoc/<year>/<day>/answers.json`. Nothing is submitted to adventofcode.com.
+`.aoc/<year>/<day>/answers.json`. Nothing is submitted to adventofcode.com unless
+the model calls a submit tool.
 
 A full Rust block in the final chat message is still accepted as a fallback for
 models that ignore the tool instructions.
@@ -173,7 +253,7 @@ models that ignore the tool instructions.
 lines on stderr with `--events`:
 
 ```sh
-cargo run -p harness -- solve 2024 1 --events --quiet 2> events.jsonl
+cargo run -p harness -- solve 2024/1 --no-submit --events --quiet 2> events.jsonl
 ```
 
 ### Model configuration
@@ -241,7 +321,7 @@ is wrong:
 Logs go to stderr, so stdout stays clean for answers and JSON:
 
 ```sh
-cargo run -p harness -- --log-level debug solve 2024 1
+cargo run -p harness -- --log-level debug solve 2024/1 --no-submit
 RUST_LOG=aoc_archive=trace,harness=debug cargo run -p harness -- scrape
 ```
 
@@ -291,7 +371,7 @@ reads the part number (`1` or `2`) from the `AOC_PART` environment variable.
 A different command can be used for any language with the manual commands:
 
 ```sh
-cargo run -p harness -- test 2024 1 --cmd 'python3 mysolver.py'
+cargo run -p harness -- run 2024/1 --examples --cmd 'python3 mysolver.py'
 ```
 
 The agent loop itself writes Rust `solve.rs` through its tools.
@@ -320,6 +400,8 @@ examples live in prose). The full statement always remains available.
 │   │   ├── puzzle.json       # structured: parts, markdown, examples, answers
 │   │   ├── puzzle.md         # statement as Markdown
 │   │   ├── answers.json      # answers recorded by the harness (parts -> answer)
+│   │   ├── submissions.jsonl # append-only Submit log (accepted, rejected, …)
+│   │   ├── remote.json       # live stars/parts/answers snapshot
 │   │   └── input.txt         # only with AOC_SESSION or --input
 │   └── ...
 └── raw/                      # cached HTTP responses (resumable scrapes)
@@ -332,14 +414,15 @@ each part so parsing can improve without refetching (`scrape --reparse`).
 
 Working end to end:
 
-- scrape/status/show/list, inputs with a session or `input`, `--reparse`
-- manual solve loop: `init` → `test` → `run`
+- scrape/list/show/input/init/run/solve/next — eight verbs, with Day and Event Selections, `--reparse`, and `--wait`
+- manual solve loop: `init` → `run --examples` → `run`
+- `--part 1|2|all` as a filter over one Day, with Unreleased/Sealed/Missing errors
 - model loop: tools, streaming, timeout, heartbeats, events, answer recording
+- opt-in submission with `--submit`, cached Star state, `list --stars`, and two-phase Part One → Part Two in one session
 - a local archive of 262 days and 100 detected example tests (not committed)
 
-Deliberately not in the MVP:
+Deliberately not in scope:
 
-- live answer submission to adventofcode.com
 - session persistence, branching, or context compaction
 - non-Rust agent solutions (manual `solve.py` / executable still works)
 - reliable example extraction for prose-heavy early years
@@ -353,6 +436,5 @@ policy. The next useful pieces, in rough priority order:
 - **Context management** — compaction once tool results fill the window.
 - **Steering/follow-ups** — inject a message while a turn is running.
 - **Retries and timeouts per tool**, plus per-tool approval policies.
-- **A live `Aoc` implementation** for submission once a cookie is available.
 - **Broader example-test extraction**, since prose-only examples (common in
   2015–2017) leave some days unverified.

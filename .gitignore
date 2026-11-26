@@ -5,8 +5,9 @@
 
 # Local Advent of Code state: puzzle text, raw cache, inputs, answers
 /.aoc/
-/solutions/**/input.txt
-/solutions/**/target/
+
+# Local solutions: kept on disk, never published
+/solutions/
 
 # Secrets and local configuration
 /.env
@@ -44,6 +45,7 @@ desktop.ini
 Thumbs.db
 
 # Local tooling and scratch files
+/TODO.md
 .direnv/
 *.orig
 *.rej
